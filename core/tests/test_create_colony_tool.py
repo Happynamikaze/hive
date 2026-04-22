@@ -38,7 +38,7 @@ from framework.tools.queen_lifecycle_tools import register_queen_lifecycle_tools
 
 
 class _FakeSession:
-    def __init__(self, sid: str = "session_test_create_colony"):
+    def __init__(self, sid: str = "session_test_create_colony", queen_name: str = "sophia"):
         self.id = sid
         self.colony = None
         self.colony_runtime = None
@@ -46,6 +46,7 @@ class _FakeSession:
         self.worker_path = None
         self.available_triggers: dict = {}
         self.active_trigger_ids: set = set()
+        self.queen_name = queen_name
 
 
 def _make_executor():
@@ -159,6 +160,64 @@ async def test_happy_path_emits_colony_created_event(patched_home: Path, patched
     assert ev.data.get("skill_name") == "my-skill"
     assert ev.data.get("skill_replaced") is False
     assert ev.data.get("is_new") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_colony_inherits_queen_override_state(
+    patched_home: Path, patched_fork: list[dict]
+) -> None:
+    """Seed the colony's skills_overrides.json from the queen's at fork
+    time. A queen who enabled a preset (e.g. hive.x-automation) before
+    calling create_colony must produce a colony that also has it
+    enabled — without needing a second UI toggle on the colony page.
+    """
+    from framework.config import QUEENS_DIR
+    from framework.skills.overrides import (
+        OverrideEntry,
+        Provenance,
+        SkillOverrideStore,
+    )
+
+    # Pre-seed the queen's override file.
+    queen_home = QUEENS_DIR / "sophia"
+    queen_home.mkdir(parents=True, exist_ok=True)
+    qstore = SkillOverrideStore.load(queen_home / "skills_overrides.json")
+    qstore.upsert(
+        "hive.x-automation",
+        OverrideEntry(enabled=True, provenance=Provenance.PRESET),
+    )
+    qstore.upsert(
+        "hive.note-taking",
+        OverrideEntry(enabled=False, provenance=Provenance.FRAMEWORK),
+    )
+    qstore.save()
+
+    executor, _ = _make_executor()
+    payload = await _call(
+        executor,
+        colony_name="inheritance_check",
+        task="t",
+        skill_name="bespoke-skill",
+        skill_description="Written during this create_colony call.",
+        skill_body=_DEFAULT_BODY,
+    )
+    assert payload.get("status") == "created", f"Tool error: {payload}"
+
+    colony_overrides = (
+        patched_home / ".hive" / "colonies" / "inheritance_check" / "skills_overrides.json"
+    )
+    cstore = SkillOverrideStore.load(colony_overrides)
+
+    # Inherited entries from the queen:
+    assert cstore.get("hive.x-automation").enabled is True
+    assert cstore.get("hive.note-taking").enabled is False
+
+    # Newly-written skill is also registered with queen_created provenance:
+    bespoke = cstore.get("bespoke-skill")
+    assert bespoke is not None
+    assert bespoke.provenance == Provenance.QUEEN_CREATED
+    assert bespoke.enabled is True
 
 
 @pytest.mark.asyncio

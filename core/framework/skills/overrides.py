@@ -64,6 +64,18 @@ class OverrideEntry:
     created_at: datetime | None = None
     created_by: str | None = None
 
+    def clone(self) -> OverrideEntry:
+        """Return a deep-enough copy (dict fields are re-allocated)."""
+        return OverrideEntry(
+            enabled=self.enabled,
+            provenance=self.provenance,
+            trust=self.trust,
+            param_overrides=dict(self.param_overrides),
+            notes=self.notes,
+            created_at=self.created_at,
+            created_by=self.created_by,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"provenance": str(self.provenance)}
         if self.enabled is not None:

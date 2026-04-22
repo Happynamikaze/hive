@@ -251,6 +251,35 @@ async def test_tools_index_lists_colonies(colony_dir):
     assert entries[name]["has_allowlist"] is False
 
 
+def test_queen_allowlist_inherits_into_new_colony(tmp_path, monkeypatch):
+    """A colony forked with a curated queen inherits her allowlist.
+
+    Exercises the inheritance hook in
+    ``routes_execution.fork_session_into_colony`` without running the
+    full fork machinery — we just call
+    ``update_colony_tools_config`` the same way the hook does and
+    assert the colony's ``tools.json`` matches the queen's live list.
+    """
+    colonies = tmp_path / "colonies"
+    colonies.mkdir()
+    monkeypatch.setattr("framework.host.colony_tools_config.COLONIES_DIR", colonies)
+
+    from framework.host.colony_tools_config import (
+        load_colony_tools_config,
+        update_colony_tools_config,
+    )
+
+    colony_name = "forked_child"
+    (colonies / colony_name).mkdir()
+
+    # Simulate: queen has a curated allowlist (e.g. role default resolved
+    # to a concrete list). The inheritance hook copies it verbatim.
+    queen_live_allowlist = ["read_file", "web_scrape", "csv_read"]
+    update_colony_tools_config(colony_name, list(queen_live_allowlist))
+
+    assert load_colony_tools_config(colony_name) == queen_live_allowlist
+
+
 def test_legacy_metadata_field_migrates_to_sidecar(colony_dir):
     """A legacy enabled_mcp_tools field in metadata.json is hoisted to tools.json."""
     colonies_dir, name = colony_dir

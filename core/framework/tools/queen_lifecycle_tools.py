@@ -1616,14 +1616,39 @@ def register_queen_lifecycle_tools(
                 }
             )
 
-        # Register the write in the colony's override store so the UI can
-        # edit/toggle it and :func:`SkillsManager._apply_overrides` carries
-        # the right provenance.
+        # Seed the colony's override ledger from the queen's current
+        # state so the colony inherits everything she had enabled (preset
+        # capability packs, toggled-off framework defaults, etc.) at fork
+        # time. The colony then owns its own copy — later queen edits
+        # don't retroactively alter this colony's skill surface.
+        # On top of the seed we upsert the newly-written skill with
+        # QUEEN_CREATED provenance so the UI renders + edits it properly.
         try:
+            from framework.config import QUEENS_DIR
+
             overrides_path = colony_dir / "skills_overrides.json"
-            store = SkillOverrideStore.load(overrides_path, scope_label=f"colony:{cn}")
             queen_id = getattr(session, "queen_name", None) or "unknown"
-            store.upsert(
+            colony_store = SkillOverrideStore.load(overrides_path, scope_label=f"colony:{cn}")
+
+            queen_overrides_path = QUEENS_DIR / queen_id / "skills_overrides.json"
+            if queen_overrides_path.exists():
+                queen_store = SkillOverrideStore.load(
+                    queen_overrides_path, scope_label=f"queen:{queen_id}"
+                )
+                # Shallow clone: queen's explicit toggles + master switch
+                # become the colony's starting state. Tombstones propagate
+                # so a queen-deleted UI skill doesn't resurrect here.
+                colony_store.all_defaults_disabled = queen_store.all_defaults_disabled
+                for sname, entry in queen_store.overrides.items():
+                    # Don't overwrite an entry the colony already set
+                    # (rare on fresh fork; matters if this is a re-fork).
+                    if sname in colony_store.overrides:
+                        continue
+                    colony_store.upsert(sname, entry.clone())
+                for sname in queen_store.deleted_ui_skills:
+                    colony_store.deleted_ui_skills.add(sname)
+
+            colony_store.upsert(
                 draft.name,
                 OverrideEntry(
                     enabled=True,
@@ -1632,7 +1657,7 @@ def register_queen_lifecycle_tools(
                     created_by=f"queen:{queen_id}",
                 ),
             )
-            store.save()
+            colony_store.save()
         except Exception:
             # Registration is best-effort; discovery still surfaces the
             # skill as project-scope even if the ledger fails to update.

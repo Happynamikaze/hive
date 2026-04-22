@@ -1577,6 +1577,39 @@ async def fork_session_into_colony(
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    # ── 4a. Inherit the queen's tool allowlist into the colony ───
+    # A colony forked from a curated queen should start with the same
+    # tool surface (otherwise the colony silently falls back to its own
+    # "allow every MCP tool" default, undoing the parent's curation).
+    # We copy the queen's LIVE effective allowlist so the snapshot
+    # reflects whatever was in force the moment the user clicked "Create
+    # Colony". Users can further narrow the colony via the Tool Library.
+    # Skip the write when the queen is on allow-all (None) so the colony
+    # keeps the same semantics without creating an inert sidecar.
+    try:
+        queen_enabled = getattr(
+            getattr(session, "phase_state", None),
+            "enabled_mcp_tools",
+            None,
+        )
+        if isinstance(queen_enabled, list):
+            from framework.host.colony_tools_config import update_colony_tools_config
+
+            update_colony_tools_config(colony_name, list(queen_enabled))
+            logger.info(
+                "Inherited queen allowlist into colony '%s' (%d tools)",
+                colony_name,
+                len(queen_enabled),
+            )
+    except Exception:
+        # Inheritance is best-effort — don't let a tools.json hiccup
+        # abort colony creation.
+        logger.warning(
+            "Failed to inherit queen allowlist into colony '%s'",
+            colony_name,
+            exc_info=True,
+        )
+
     # ── 5. Update source queen session meta.json ─────────────────
     # Link the originating session back to the colony for discovery.
     source_meta_path = source_queen_dir / "meta.json"
