@@ -17,7 +17,7 @@ The fastest way to get started:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/adenhq/hive.git
+git clone https://github.com/aden-hive/hive.git
 cd hive
 
 # 2. Run automated setup
@@ -31,7 +31,7 @@ uv run python -c "import framework; import aden_tools; print('✓ Setup complete
 
 ```powershell
 # 1. Clone the repository
-git clone https://github.com/adenhq/hive.git
+git clone https://github.com/aden-hive/hive.git
 cd hive
 
 # 2. Run automated setup
@@ -147,14 +147,8 @@ hive/
 # Launch the web dashboard in your browser
 hive open
 
-# Browse and run agents in terminal
-hive tui
-
 # Run a specific agent
 hive run exports/my_agent --input '{"task": "Your input here"}'
-
-# Run with TUI dashboard
-hive run exports/my_agent --tui
 
 ```
 
@@ -194,7 +188,7 @@ PYTHONPATH=exports uv run python -m my_agent test --type success
 
 ## Next Steps
 
-1. **Dashboard**: Run `hive open` to launch the web dashboard, or `hive tui` for the terminal UI
+1. **Dashboard**: Run `hive open` to launch the web dashboard
 2. **Detailed Setup**: See [environment-setup.md](./environment-setup.md)
 3. **Developer Guide**: See [developer-guide.md](./developer-guide.md)
 4. **Build Agents**: Use the coder-tools `initialize_and_build_agent` tool in Claude Code
@@ -240,6 +234,6 @@ pip uninstall -y framework tools
 ## Getting Help
 
 - **Documentation**: Check the `/docs` folder
-- **Issues**: [github.com/adenhq/hive/issues](https://github.com/adenhq/hive/issues)
+- **Issues**: [github.com/adenhq/hive/issues](https://github.com/aden-hive/hive/issues)
 - **Discord**: [discord.com/invite/MXE49hrKDk](https://discord.com/invite/MXE49hrKDk)
 - **Build Agents**: Use the coder-tools workflow to create agents

@@ -7,6 +7,8 @@ Groq, and local models.
 See: https://docs.litellm.ai/docs/providers
 """
 
+from __future__ import annotations
+
 import ast
 import asyncio
 import hashlib
@@ -18,7 +20,10 @@ import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from framework.llm.key_pool import KeyPool
 
 try:
     import litellm
@@ -32,6 +37,10 @@ from framework.llm.provider import LLMProvider, LLMResponse, Tool
 from framework.llm.stream_events import StreamEvent
 
 logger = logging.getLogger(__name__)
+
+logging.getLogger("openai._base_client").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _patch_litellm_anthropic_oauth() -> None:
@@ -91,9 +100,7 @@ def _patch_litellm_anthropic_oauth() -> None:
             result["authorization"] = f"Bearer {token}"
             # Merge the OAuth beta header with any existing beta headers.
             existing_beta = result.get("anthropic-beta", "")
-            beta_parts = (
-                [b.strip() for b in existing_beta.split(",") if b.strip()] if existing_beta else []
-            )
+            beta_parts = [b.strip() for b in existing_beta.split(",") if b.strip()] if existing_beta else []
             if ANTHROPIC_OAUTH_BETA_HEADER not in beta_parts:
                 beta_parts.append(ANTHROPIC_OAUTH_BETA_HEADER)
             result["anthropic-beta"] = ",".join(beta_parts)
@@ -159,9 +166,37 @@ if litellm is not None:
     # (e.g. stream_options for Anthropic) instead of forwarding them verbatim.
     litellm.drop_params = True
 
+
+def _is_ollama_model(model: str) -> bool:
+    """Return True for any Ollama model string (ollama/ or ollama_chat/ prefix)."""
+    return model.startswith("ollama/") or model.startswith("ollama_chat/")
+
+
+def _ensure_ollama_chat_prefix(model: str) -> str:
+    """Normalise Ollama model strings to use the ollama_chat/ prefix.
+
+    LiteLLM requires the ``ollama_chat/`` prefix (not ``ollama/``) to enable
+    native function-calling support.  With ``ollama/``, LiteLLM falls back to
+    JSON-mode tool calls, which the framework cannot parse as real tool calls.
+
+    See: https://docs.litellm.ai/docs/providers/ollama#example-usage---tool-calling
+    """
+    if model.startswith("ollama/"):
+        return "ollama_chat/" + model[len("ollama/") :]
+    return model
+
+
 RATE_LIMIT_MAX_RETRIES = 10
 RATE_LIMIT_BACKOFF_BASE = 2  # seconds
 RATE_LIMIT_MAX_DELAY = 120  # seconds - cap to prevent absurd waits
+# Separate, much lower cap for "empty response, finish_reason=stop"
+# scenarios. Unlike a real 429, these are rarely transient: Gemini
+# returns stop+empty on silently-filtered safety blocks, poisoned
+# conversation state (dangling tool_result after compaction), or
+# malformed tool schemas. Waiting minutes doesn't fix any of those, so
+# give up after 3 attempts (2+4+8 = 14s) and surface an actionable
+# error instead of burning 12+ minutes on exponential backoff.
+EMPTY_RESPONSE_MAX_RETRIES = 3
 MINIMAX_API_BASE = "https://api.minimax.io/v1"
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
@@ -181,6 +216,54 @@ _CACHE_CONTROL_PREFIXES = (
 
 def _model_supports_cache_control(model: str) -> bool:
     return any(model.startswith(p) for p in _CACHE_CONTROL_PREFIXES)
+
+
+def _build_system_message(
+    system: str,
+    system_dynamic_suffix: str | None,
+    model: str,
+) -> dict[str, Any] | None:
+    """Construct the system-role message for the chat completion.
+
+    Returns ``None`` when there is nothing to send.
+
+    Two-block split path — used when the caller supplied a non-empty
+    ``system_dynamic_suffix`` AND the provider honors ``cache_control``
+    (Anthropic, MiniMax, Z-AI/GLM). We emit ``content`` as a list of two
+    text blocks with an ephemeral ``cache_control`` marker on the first
+    block only. The prompt cache keeps the static prefix warm across
+    turns and across iterations within a turn; only the small dynamic
+    tail is recomputed on every request.
+
+    Single-string path — used for every other case (no suffix provided,
+    or provider doesn't honor ``cache_control``). We concatenate
+    ``system`` + ``\\n\\n`` + ``system_dynamic_suffix`` and attach
+    ``cache_control`` to the whole message when the provider supports
+    it. This is byte-identical to the pre-split behavior for all
+    non-cache-control providers (OpenAI, Gemini, Groq, Ollama, etc.).
+    """
+    if not system and not system_dynamic_suffix:
+        return None
+    if system_dynamic_suffix and _model_supports_cache_control(model):
+        content_blocks: list[dict[str, Any]] = []
+        if system:
+            content_blocks.append(
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            )
+        content_blocks.append({"type": "text", "text": system_dynamic_suffix})
+        return {"role": "system", "content": content_blocks}
+    # Single-string path (legacy or no-cache-control provider).
+    combined = system
+    if system_dynamic_suffix:
+        combined = f"{system}\n\n{system_dynamic_suffix}" if system else system_dynamic_suffix
+    sys_msg: dict[str, Any] = {"role": "system", "content": combined}
+    if _model_supports_cache_control(model):
+        sys_msg["cache_control"] = {"type": "ephemeral"}
+    return sys_msg
 
 
 # Kimi For Coding uses an Anthropic-compatible endpoint (no /v1 suffix).
@@ -225,9 +308,7 @@ def _claude_code_billing_header(messages: list[dict[str, Any]]) -> str:
                 break
 
     sampled = "".join(_sample_js_code_unit(first_text, i) for i in (4, 7, 20))
-    version_hash = hashlib.sha256(
-        f"{_CLAUDE_CODE_BILLING_SALT}{sampled}{CLAUDE_CODE_VERSION}".encode()
-    ).hexdigest()
+    version_hash = hashlib.sha256(f"{_CLAUDE_CODE_BILLING_SALT}{sampled}{CLAUDE_CODE_VERSION}".encode()).hexdigest()
     entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").strip() or "cli"
     return (
         f"x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{version_hash[:3]}; "
@@ -251,6 +332,10 @@ OPENROUTER_TOOL_CALL_RE = re.compile(
 OPENROUTER_TOOL_COMPAT_CACHE_TTL_SECONDS = 3600
 # OpenRouter routing can change over time, so tool-compat caching must expire.
 OPENROUTER_TOOL_COMPAT_MODEL_CACHE: dict[str, float] = {}
+
+# Transient stream errors (network blips, timeouts) use a separate cap
+# from rate-limit retries — 3 retries is sufficient for connection failures.
+STREAM_TRANSIENT_MAX_RETRIES = 3
 
 # Directory for dumping failed requests
 FAILED_REQUESTS_DIR = Path.home() / ".hive" / "failed_requests"
@@ -295,9 +380,7 @@ def _prune_failed_request_dumps(max_files: int = MAX_FAILED_REQUEST_DUMPS) -> No
 
 def _remember_openrouter_tool_compat_model(model: str) -> None:
     """Cache OpenRouter tool-compat fallback for a bounded time window."""
-    OPENROUTER_TOOL_COMPAT_MODEL_CACHE[model] = (
-        time.monotonic() + OPENROUTER_TOOL_COMPAT_CACHE_TTL_SECONDS
-    )
+    OPENROUTER_TOOL_COMPAT_MODEL_CACHE[model] = time.monotonic() + OPENROUTER_TOOL_COMPAT_CACHE_TTL_SECONDS
 
 
 def _is_openrouter_tool_compat_cached(model: str) -> bool:
@@ -318,34 +401,145 @@ def _dump_failed_request(
     attempt: int,
 ) -> str:
     """Dump failed request to a file for debugging. Returns the file path."""
-    FAILED_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        FAILED_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"{error_type}_{model.replace('/', '_')}_{timestamp}.json"
-    filepath = FAILED_REQUESTS_DIR / filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{error_type}_{model.replace('/', '_')}_{timestamp}.json"
+        filepath = FAILED_REQUESTS_DIR / filename
 
-    # Build dump data
-    messages = kwargs.get("messages", [])
-    dump_data = {
-        "timestamp": datetime.now().isoformat(),
-        "model": model,
-        "error_type": error_type,
-        "attempt": attempt,
-        "estimated_tokens": _estimate_tokens(model, messages),
-        "num_messages": len(messages),
-        "messages": messages,
-        "tools": kwargs.get("tools"),
-        "max_tokens": kwargs.get("max_tokens"),
-        "temperature": kwargs.get("temperature"),
+        # Build dump data
+        messages = kwargs.get("messages", [])
+        dump_data = {
+            "timestamp": datetime.now().isoformat(),
+            "model": model,
+            "error_type": error_type,
+            "attempt": attempt,
+            "estimated_tokens": _estimate_tokens(model, messages),
+            "num_messages": len(messages),
+            "api_base": kwargs.get("api_base"),
+            "request_keys": sorted(kwargs.keys()),
+            "messages": messages,
+            "tools": kwargs.get("tools"),
+            "max_tokens": kwargs.get("max_tokens"),
+            "temperature": kwargs.get("temperature"),
+            "stream": kwargs.get("stream"),
+            "tool_choice": kwargs.get("tool_choice"),
+            "response_format": kwargs.get("response_format"),
+        }
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(dump_data, f, indent=2, default=str)
+
+        # Prune old dumps to prevent unbounded disk growth
+        _prune_failed_request_dumps()
+
+        return str(filepath)
+    except OSError as e:
+        logger.warning(f"Failed to dump request debug log to {FAILED_REQUESTS_DIR}: {e}")
+        return "log_write_failed"
+
+
+def _summarize_message_content(content: Any) -> dict[str, Any]:
+    """Return a structural summary of one message content payload."""
+    if isinstance(content, str):
+        return {
+            "content_kind": "string",
+            "text_chars": len(content),
+        }
+
+    if isinstance(content, list):
+        block_types: list[str] = []
+        text_chars = 0
+        for block in content:
+            if isinstance(block, dict):
+                block_type = str(block.get("type", "unknown"))
+                block_types.append(block_type)
+                if block_type == "text":
+                    text_chars += len(str(block.get("text", "")))
+                elif block_type == "tool_result":
+                    block_content = block.get("content")
+                    if isinstance(block_content, str):
+                        text_chars += len(block_content)
+                    elif isinstance(block_content, list):
+                        for inner in block_content:
+                            if isinstance(inner, dict) and inner.get("type") == "text":
+                                text_chars += len(str(inner.get("text", "")))
+            else:
+                block_types.append(type(block).__name__)
+        return {
+            "content_kind": "list",
+            "blocks": len(content),
+            "block_types": block_types,
+            "text_chars": text_chars,
+        }
+
+    return {
+        "content_kind": type(content).__name__,
     }
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(dump_data, f, indent=2, default=str)
 
-    # Prune old dumps to prevent unbounded disk growth
-    _prune_failed_request_dumps()
+def _summarize_messages_for_log(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build a high-signal, no-secret summary of the outgoing messages payload."""
+    summary: list[dict[str, Any]] = []
+    for idx, message in enumerate(messages):
+        item: dict[str, Any] = {
+            "idx": idx,
+            "role": message.get("role"),
+            "keys": sorted(message.keys()),
+        }
+        item.update(_summarize_message_content(message.get("content")))
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            item["tool_calls"] = len(tool_calls)
+            tool_names = []
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    fn = tc.get("function")
+                    if isinstance(fn, dict) and fn.get("name"):
+                        tool_names.append(str(fn["name"]))
+            if tool_names:
+                item["tool_call_names"] = tool_names
+        if message.get("cache_control"):
+            item["cache_control"] = True
+        if message.get("tool_call_id"):
+            item["tool_call_id"] = str(message.get("tool_call_id"))
+        summary.append(item)
+    return summary
 
-    return str(filepath)
+
+def _summarize_request_for_log(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact structural summary of a LiteLLM request payload."""
+    tools = kwargs.get("tools")
+    tool_names: list[str] = []
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict):
+                fn = tool.get("function")
+                if isinstance(fn, dict) and fn.get("name"):
+                    tool_names.append(str(fn["name"]))
+
+    messages = kwargs.get("messages", [])
+    if isinstance(messages, list):
+        non_system_roles = [m.get("role") for m in messages if m.get("role") != "system"]
+    else:
+        non_system_roles = []
+    return {
+        "model": kwargs.get("model"),
+        "api_base": kwargs.get("api_base"),
+        "stream": kwargs.get("stream"),
+        "max_tokens": kwargs.get("max_tokens"),
+        "tool_count": len(tools) if isinstance(tools, list) else 0,
+        "tool_names": tool_names,
+        "tool_choice": kwargs.get("tool_choice"),
+        "response_format": bool(kwargs.get("response_format")),
+        "message_count": len(messages) if isinstance(messages, list) else 0,
+        "non_system_message_count": len(non_system_roles),
+        "first_non_system_role": non_system_roles[0] if non_system_roles else None,
+        "last_non_system_role": non_system_roles[-1] if non_system_roles else None,
+        "system_only": bool(messages) and not non_system_roles,
+        "messages": _summarize_messages_for_log(messages if isinstance(messages, list) else []),
+    }
 
 
 def _compute_retry_delay(
@@ -438,6 +632,59 @@ def _is_stream_transient_error(exc: BaseException) -> bool:
     return isinstance(exc, transient_types)
 
 
+def _extract_text_tool_calls(
+    text: str,
+) -> tuple[list, str]:
+    """Extract hallucinated tool calls from ``<tool_code>`` blocks in LLM text.
+
+    Some models (notably Gemini) emit tool invocations as text instead of using
+    the structured function-calling API.  This function parses those blocks and
+    returns ``(tool_call_events, cleaned_text)`` where *cleaned_text* has the
+    ``<tool_code>`` blocks removed.
+
+    Expected format::
+
+        <tool_code>
+        {
+          "tool_name": { ...args }
+        }
+        </tool_code>
+    """
+    from framework.llm.stream_events import ToolCallEvent
+
+    pattern = re.compile(r"<tool_code>\s*(.*?)\s*</tool_code>", re.DOTALL)
+    events: list[ToolCallEvent] = []
+    cleaned = text
+
+    for match in pattern.finditer(text):
+        raw = match.group(1).strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("[_extract_text_tool_calls] failed to parse JSON: %s", raw[:200])
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+
+        for tool_name, tool_args in payload.items():
+            key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+            digest = hashlib.md5(key.encode()).hexdigest()[:12]
+            call_id = f"synth_{digest}"
+            events.append(
+                ToolCallEvent(
+                    tool_use_id=call_id,
+                    tool_name=tool_name,
+                    tool_input=tool_args if isinstance(tool_args, dict) else {},
+                )
+            )
+
+    if events:
+        cleaned = pattern.sub("", text).strip()
+
+    return events, cleaned
+
+
 class LiteLLMProvider(LLMProvider):
     """
     LiteLLM-based LLM provider for multi-provider support.
@@ -480,6 +727,7 @@ class LiteLLMProvider(LLMProvider):
         model: str = "gpt-4o-mini",
         api_key: str | None = None,
         api_base: str | None = None,
+        api_keys: list[str] | None = None,
         **kwargs: Any,
     ):
         """
@@ -492,6 +740,9 @@ class LiteLLMProvider(LLMProvider):
                      look for the appropriate env var (OPENAI_API_KEY,
                      ANTHROPIC_API_KEY, etc.)
             api_base: Custom API base URL (for proxies or local deployments)
+            api_keys: Optional list of API keys for key-pool rotation. When
+                      provided with 2+ keys, a :class:`KeyPool` is created and
+                      keys are rotated on rate-limit errors.
             **kwargs: Additional arguments passed to litellm.completion()
         """
         # Kimi For Coding exposes an Anthropic-compatible endpoint at
@@ -499,7 +750,9 @@ class LiteLLMProvider(LLMProvider):
         # Translate kimi/ prefix to anthropic/ so litellm uses the Anthropic
         # Messages API handler and routes to that endpoint — no special headers needed.
         _original_model = model
-        if model.lower().startswith("kimi/"):
+        if _is_ollama_model(model):
+            model = _ensure_ollama_chat_prefix(model)
+        elif model.lower().startswith("kimi/"):
             model = "anthropic/" + model[len("kimi/") :]
             # Normalise api_base: litellm's Anthropic handler appends /v1/messages,
             # so the base must be https://api.kimi.com/coding (no /v1 suffix).
@@ -511,27 +764,64 @@ class LiteLLMProvider(LLMProvider):
             if api_base and api_base.rstrip("/").endswith("/v1"):
                 api_base = api_base.rstrip("/")[:-3]
         self.model = model
-        self.api_key = api_key
+        # Key pool: when multiple keys are provided, enable rotation.
+        self._key_pool: KeyPool | None = None
+        if api_keys and len(api_keys) > 1:
+            from framework.llm.key_pool import KeyPool
+
+            self._key_pool = KeyPool(api_keys)
+            self.api_key = api_keys[0]  # default for OAuth detection below
+            logger.info(
+                "[litellm] Key pool enabled with %d keys for model %s",
+                len(api_keys),
+                model,
+            )
+        else:
+            self.api_key = api_key or (api_keys[0] if api_keys else None)
         self.api_base = api_base or self._default_api_base_for_model(_original_model)
         self.extra_kwargs = kwargs
         # Detect Claude Code OAuth subscription by checking the api_key prefix.
-        self._claude_code_oauth = bool(api_key and api_key.startswith("sk-ant-oat"))
+        self._claude_code_oauth = bool(self.api_key and self.api_key.startswith("sk-ant-oat"))
         if self._claude_code_oauth:
             # Anthropic requires a specific User-Agent for OAuth requests.
             eh = self.extra_kwargs.setdefault("extra_headers", {})
             eh.setdefault("user-agent", CLAUDE_CODE_USER_AGENT)
         # The Codex ChatGPT backend (chatgpt.com/backend-api/codex) rejects
         # several standard OpenAI params: max_output_tokens, stream_options.
-        self._codex_backend = bool(
-            self.api_base and "chatgpt.com/backend-api/codex" in self.api_base
-        )
+        self._codex_backend = bool(self.api_base and "chatgpt.com/backend-api/codex" in self.api_base)
         # Antigravity routes through a local OpenAI-compatible proxy — no patches needed.
         self._antigravity = bool(self.api_base and "localhost:8069" in self.api_base)
 
         if litellm is None:
-            raise ImportError(
-                "LiteLLM is not installed. Please install it with: uv pip install litellm"
-            )
+            raise ImportError("LiteLLM is not installed. Please install it with: uv pip install litellm")
+
+    def reconfigure(self, model: str, api_key: str | None = None, api_base: str | None = None) -> None:
+        """Hot-swap the model, API key, and/or base URL on this provider instance.
+
+        Since the same LiteLLMProvider object is shared by reference across the
+        session, queen runner, agent runtime, and execution streams, mutating
+        these attributes in-place propagates to all callers on the next LLM call.
+        """
+        _original_model = model
+        if _is_ollama_model(model):
+            model = _ensure_ollama_chat_prefix(model)
+        elif model.lower().startswith("kimi/"):
+            model = "anthropic/" + model[len("kimi/") :]
+            if api_base and api_base.rstrip("/").endswith("/v1"):
+                api_base = api_base.rstrip("/")[:-3]
+        elif model.lower().startswith("hive/"):
+            model = "anthropic/" + model[len("hive/") :]
+            if api_base and api_base.rstrip("/").endswith("/v1"):
+                api_base = api_base.rstrip("/")[:-3]
+        self.model = model
+        self.api_key = api_key
+        self.api_base = api_base or self._default_api_base_for_model(_original_model)
+        self._claude_code_oauth = bool(api_key and api_key.startswith("sk-ant-oat"))
+        if self._claude_code_oauth:
+            eh = self.extra_kwargs.setdefault("extra_headers", {})
+            eh.setdefault("user-agent", CLAUDE_CODE_USER_AGENT)
+        self._codex_backend = bool(self.api_base and "chatgpt.com/backend-api/codex" in self.api_base)
+        self._antigravity = bool(self.api_base and "localhost:8069" in self.api_base)
 
         # Note: The Codex ChatGPT backend is a Responses API endpoint at
         # chatgpt.com/backend-api/codex/responses.  LiteLLM's model registry
@@ -553,13 +843,21 @@ class LiteLLMProvider(LLMProvider):
             return HIVE_API_BASE
         return None
 
-    def _completion_with_rate_limit_retry(
-        self, max_retries: int | None = None, **kwargs: Any
-    ) -> Any:
-        """Call litellm.completion with retry on 429 rate limit errors and empty responses."""
+    def _completion_with_rate_limit_retry(self, max_retries: int | None = None, **kwargs: Any) -> Any:
+        """Call litellm.completion with retry on 429 rate limit errors and empty responses.
+
+        When a :class:`KeyPool` is configured, rate-limited keys are rotated
+        automatically so the next attempt uses a different key -- no sleep
+        needed between attempts.
+        """
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
         for attempt in range(retries + 1):
+            # Rotate key from pool when available.
+            current_key: str | None = None
+            if self._key_pool:
+                current_key = self._key_pool.get_key()
+                kwargs["api_key"] = current_key
             try:
                 response = litellm.completion(**kwargs)  # type: ignore[union-attr]
 
@@ -577,15 +875,10 @@ class LiteLLMProvider(LLMProvider):
                         None,
                     )
                     if last_role == "assistant":
-                        logger.debug(
-                            "[retry] Empty response after assistant message — "
-                            "expected, not retrying."
-                        )
+                        logger.debug("[retry] Empty response after assistant message — expected, not retrying.")
                         return response
 
-                    finish_reason = (
-                        response.choices[0].finish_reason if response.choices else "unknown"
-                    )
+                    finish_reason = response.choices[0].finish_reason if response.choices else "unknown"
                     # Dump full request to file for debugging
                     token_count, token_method = _estimate_tokens(model, messages)
                     dump_path = _dump_failed_request(
@@ -614,28 +907,51 @@ class LiteLLMProvider(LLMProvider):
                         )
                         return response
 
-                    if attempt == retries:
+                    empty_cap = min(retries, EMPTY_RESPONSE_MAX_RETRIES)
+                    if attempt >= empty_cap:
                         logger.error(
-                            f"[retry] GAVE UP on {model} after {retries + 1} "
-                            f"attempts — empty response "
+                            f"[retry] GAVE UP on {model} after "
+                            f"{attempt + 1} attempts — empty response "
                             f"(finish_reason={finish_reason}, "
-                            f"choices={len(response.choices) if response.choices else 0})"
+                            f"choices={len(response.choices) if response.choices else 0}). "
+                            f"This is almost never a rate limit despite the "
+                            f"earlier log message — check the dumped request "
+                            f"at {dump_path} for poisoned conversation state "
+                            f"(dangling tool_result after compaction), a "
+                            f"safety-filter trigger in the prompt, or a "
+                            f"malformed tool schema."
                         )
                         return response
                     wait = _compute_retry_delay(attempt)
                     logger.warning(
                         f"[retry] {model} returned empty response "
                         f"(finish_reason={finish_reason}, "
-                        f"choices={len(response.choices) if response.choices else 0}) — "
-                        f"likely rate limited or quota exceeded. "
+                        f"choices={len(response.choices) if response.choices else 0}). "
                         f"Retrying in {wait}s "
-                        f"(attempt {attempt + 1}/{retries})"
+                        f"(attempt {attempt + 1}/{empty_cap}). "
+                        f"Note: empty-response retries are capped at "
+                        f"{EMPTY_RESPONSE_MAX_RETRIES} because this is rarely "
+                        f"a transient rate limit on small payloads."
                     )
                     time.sleep(wait)
                     continue
 
+                if self._key_pool and current_key:
+                    self._key_pool.mark_success(current_key)
                 return response
             except RateLimitError as e:
+                # Key pool: mark the offending key and rotate immediately.
+                if self._key_pool and current_key:
+                    self._key_pool.mark_rate_limited(current_key, retry_after=60.0)
+                    # When we have other healthy keys, skip the sleep -- the
+                    # next iteration will pick a different key automatically.
+                    if attempt < retries:
+                        logger.info(
+                            "[retry] Key pool rotating away from ...%s on 429",
+                            current_key[-6:],
+                        )
+                        continue
+
                 # Dump full request to file for debugging
                 messages = kwargs.get("messages", [])
                 token_count, token_method = _estimate_tokens(model, messages)
@@ -648,7 +964,7 @@ class LiteLLMProvider(LLMProvider):
                 if attempt == retries:
                     logger.error(
                         f"[retry] GAVE UP on {model} after {retries + 1} "
-                        f"attempts — rate limit error: {e!s}. "
+                        f"attempts -- rate limit error: {e!s}. "
                         f"~{token_count} tokens ({token_method}). "
                         f"Full request dumped to: {dump_path}"
                     )
@@ -722,6 +1038,10 @@ class LiteLLMProvider(LLMProvider):
         # Add tools if provided
         if tools:
             kwargs["tools"] = [self._tool_to_openai_format(t) for t in tools]
+            if _is_ollama_model(self.model):
+                # Ollama requires explicit tool_choice=auto for function calling
+                # so future readers don't have to guess.
+                kwargs.setdefault("tool_choice", "auto")
 
         # Add response_format for structured output
         # LiteLLM passes this through to the underlying provider
@@ -757,16 +1077,20 @@ class LiteLLMProvider(LLMProvider):
     # Async variants — non-blocking on the event loop
     # ------------------------------------------------------------------
 
-    async def _acompletion_with_rate_limit_retry(
-        self, max_retries: int | None = None, **kwargs: Any
-    ) -> Any:
+    async def _acompletion_with_rate_limit_retry(self, max_retries: int | None = None, **kwargs: Any) -> Any:
         """Async version of _completion_with_rate_limit_retry.
 
         Uses litellm.acompletion and asyncio.sleep instead of blocking calls.
+        When a :class:`KeyPool` is configured, rate-limited keys are rotated.
         """
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
         for attempt in range(retries + 1):
+            # Rotate key from pool when available.
+            current_key: str | None = None
+            if self._key_pool:
+                current_key = self._key_pool.get_key()
+                kwargs["api_key"] = current_key
             try:
                 response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
 
@@ -779,15 +1103,10 @@ class LiteLLMProvider(LLMProvider):
                         None,
                     )
                     if last_role == "assistant":
-                        logger.debug(
-                            "[async-retry] Empty response after assistant message — "
-                            "expected, not retrying."
-                        )
+                        logger.debug("[async-retry] Empty response after assistant message — expected, not retrying.")
                         return response
 
-                    finish_reason = (
-                        response.choices[0].finish_reason if response.choices else "unknown"
-                    )
+                    finish_reason = response.choices[0].finish_reason if response.choices else "unknown"
                     token_count, token_method = _estimate_tokens(model, messages)
                     dump_path = _dump_failed_request(
                         model=model,
@@ -815,28 +1134,53 @@ class LiteLLMProvider(LLMProvider):
                         )
                         return response
 
-                    if attempt == retries:
+                    # Use a much lower retry cap for empty-response
+                    # recoveries than for real exceptions. These are
+                    # almost never transient (see EMPTY_RESPONSE_MAX_RETRIES
+                    # rationale at the top of the file).
+                    empty_cap = min(retries, EMPTY_RESPONSE_MAX_RETRIES)
+                    if attempt >= empty_cap:
                         logger.error(
-                            f"[async-retry] GAVE UP on {model} after {retries + 1} "
-                            f"attempts — empty response "
+                            f"[async-retry] GAVE UP on {model} after "
+                            f"{attempt + 1} attempts — empty response "
                             f"(finish_reason={finish_reason}, "
-                            f"choices={len(response.choices) if response.choices else 0})"
+                            f"choices={len(response.choices) if response.choices else 0}). "
+                            f"This is almost never a rate limit despite the "
+                            f"earlier log message — check the dumped request "
+                            f"at {dump_path} for poisoned conversation state "
+                            f"(dangling tool_result after compaction), a "
+                            f"safety-filter trigger in the prompt, or a "
+                            f"malformed tool schema."
                         )
                         return response
                     wait = _compute_retry_delay(attempt)
                     logger.warning(
                         f"[async-retry] {model} returned empty response "
                         f"(finish_reason={finish_reason}, "
-                        f"choices={len(response.choices) if response.choices else 0}) — "
-                        f"likely rate limited or quota exceeded. "
+                        f"choices={len(response.choices) if response.choices else 0}). "
                         f"Retrying in {wait}s "
-                        f"(attempt {attempt + 1}/{retries})"
+                        f"(attempt {attempt + 1}/{empty_cap}). "
+                        f"Note: empty-response retries are capped at "
+                        f"{EMPTY_RESPONSE_MAX_RETRIES} because this is rarely "
+                        f"a transient rate limit on small payloads."
                     )
                     await asyncio.sleep(wait)
                     continue
 
+                if self._key_pool and current_key:
+                    self._key_pool.mark_success(current_key)
                 return response
             except RateLimitError as e:
+                # Key pool: mark the offending key and rotate immediately.
+                if self._key_pool and current_key:
+                    self._key_pool.mark_rate_limited(current_key, retry_after=60.0)
+                    if attempt < retries:
+                        logger.info(
+                            "[async-retry] Key pool rotating away from ...%s on 429",
+                            current_key[-6:],
+                        )
+                        continue
+
                 messages = kwargs.get("messages", [])
                 token_count, token_method = _estimate_tokens(model, messages)
                 dump_path = _dump_failed_request(
@@ -848,7 +1192,7 @@ class LiteLLMProvider(LLMProvider):
                 if attempt == retries:
                     logger.error(
                         f"[async-retry] GAVE UP on {model} after {retries + 1} "
-                        f"attempts — rate limit error: {e!s}. "
+                        f"attempts -- rate limit error: {e!s}. "
                         f"~{token_count} tokens ({token_method}). "
                         f"Full request dumped to: {dump_path}"
                     )
@@ -873,8 +1217,16 @@ class LiteLLMProvider(LLMProvider):
         response_format: dict[str, Any] | None = None,
         json_mode: bool = False,
         max_retries: int | None = None,
+        system_dynamic_suffix: str | None = None,
     ) -> LLMResponse:
-        """Async version of complete(). Uses litellm.acompletion — non-blocking."""
+        """Async version of complete(). Uses litellm.acompletion — non-blocking.
+
+        ``system_dynamic_suffix`` is an optional per-turn tail. When set and
+        the provider honors ``cache_control``, ``system`` is sent as the
+        cached prefix and the suffix trails as an uncached second content
+        block. Otherwise the two strings are concatenated into a single
+        system message (legacy behavior).
+        """
         # Codex ChatGPT backend requires streaming — route through stream() which
         # already handles Codex quirks and has proper tool call accumulation.
         if self._codex_backend:
@@ -885,6 +1237,7 @@ class LiteLLMProvider(LLMProvider):
                 max_tokens=max_tokens,
                 response_format=response_format,
                 json_mode=json_mode,
+                system_dynamic_suffix=system_dynamic_suffix,
             )
             return await self._collect_stream_to_response(stream_iter)
 
@@ -892,10 +1245,8 @@ class LiteLLMProvider(LLMProvider):
         if self._claude_code_oauth:
             billing = _claude_code_billing_header(messages)
             full_messages.append({"role": "system", "content": billing})
-        if system:
-            sys_msg: dict[str, Any] = {"role": "system", "content": system}
-            if _model_supports_cache_control(self.model):
-                sys_msg["cache_control"] = {"type": "ephemeral"}
+        sys_msg = _build_system_message(system, system_dynamic_suffix, self.model)
+        if sys_msg is not None:
             full_messages.append(sys_msg)
         full_messages.extend(messages)
 
@@ -919,6 +1270,10 @@ class LiteLLMProvider(LLMProvider):
             kwargs["api_base"] = self.api_base
         if tools:
             kwargs["tools"] = [self._tool_to_openai_format(t) for t in tools]
+            if _is_ollama_model(self.model):
+                # Ollama requires explicit tool_choice=auto for function calling
+                # so future readers don't have to guess.
+                kwargs.setdefault("tool_choice", "auto")
         if response_format:
             kwargs["response_format"] = response_format
 
@@ -970,6 +1325,12 @@ class LiteLLMProvider(LLMProvider):
             return True
         api_base = (self.api_base or "").lower()
         return "openrouter.ai/api/v1" in api_base
+
+    def _is_zai_openai_backend(self) -> bool:
+        """Return True when using Z-AI's OpenAI-compatible chat endpoint."""
+        model = (self.model or "").lower()
+        api_base = (self.api_base or "").lower()
+        return "api.z.ai" in api_base or model.startswith("openai/glm-") or model == "glm-5"
 
     def _should_use_openrouter_tool_compat(
         self,
@@ -1036,8 +1397,7 @@ class LiteLLMProvider(LLMProvider):
                 )
                 return text_tool_content, text_tool_calls
             logger.info(
-                "[openrouter-tool-compat] %s returned non-JSON fallback content; "
-                "treating it as plain text.",
+                "[openrouter-tool-compat] %s returned non-JSON fallback content; treating it as plain text.",
                 self.model,
             )
             return content.strip(), []
@@ -1189,9 +1549,7 @@ class LiteLLMProvider(LLMProvider):
             )
             return repaired
 
-        raise ValueError(
-            f"Failed to parse tool call arguments for '{tool_name}' (likely truncated JSON)."
-        )
+        raise ValueError(f"Failed to parse tool call arguments for '{tool_name}' (likely truncated JSON).")
 
     def _parse_openrouter_text_tool_calls(
         self,
@@ -1348,11 +1706,7 @@ class LiteLLMProvider(LLMProvider):
         return [
             message
             for message in full_messages
-            if not (
-                message.get("role") == "assistant"
-                and not message.get("content")
-                and not message.get("tool_calls")
-            )
+            if not (message.get("role") == "assistant" and not message.get("content") and not message.get("tool_calls"))
         ]
 
     async def _acomplete_via_openrouter_tool_compat(
@@ -1361,8 +1715,17 @@ class LiteLLMProvider(LLMProvider):
         system: str,
         tools: list[Tool],
         max_tokens: int,
+        system_dynamic_suffix: str | None = None,
     ) -> LLMResponse:
-        """Emulate tool calling via JSON when OpenRouter rejects native tools."""
+        """Emulate tool calling via JSON when OpenRouter rejects native tools.
+
+        OpenRouter models don't honor ``cache_control`` on content blocks, so
+        when a ``system_dynamic_suffix`` is provided we simply concatenate it
+        onto ``system`` before building the compat messages — behaviorally
+        identical to today's single-string path.
+        """
+        if system_dynamic_suffix:
+            system = f"{system}\n\n{system_dynamic_suffix}" if system else system_dynamic_suffix
         full_messages = self._build_openrouter_tool_compat_messages(messages, system, tools)
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -1405,6 +1768,7 @@ class LiteLLMProvider(LLMProvider):
         system: str,
         tools: list[Tool],
         max_tokens: int,
+        system_dynamic_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Fallback stream for OpenRouter models without native tool support."""
         from framework.llm.stream_events import (
@@ -1425,6 +1789,7 @@ class LiteLLMProvider(LLMProvider):
                 system=system,
                 tools=tools,
                 max_tokens=max_tokens,
+                system_dynamic_suffix=system_dynamic_suffix,
             )
         except Exception as e:
             yield StreamErrorEvent(error=str(e), recoverable=False)
@@ -1459,6 +1824,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int,
         response_format: dict[str, Any] | None,
         json_mode: bool,
+        system_dynamic_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Fallback path: convert non-stream completion to stream events.
 
@@ -1482,6 +1848,7 @@ class LiteLLMProvider(LLMProvider):
                 max_tokens=max_tokens,
                 response_format=response_format,
                 json_mode=json_mode,
+                system_dynamic_suffix=system_dynamic_suffix,
             )
         except Exception as e:
             yield StreamErrorEvent(error=str(e), recoverable=False)
@@ -1524,6 +1891,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         response_format: dict[str, Any] | None = None,
         json_mode: bool = False,
+        system_dynamic_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream a completion via litellm.acompletion(stream=True).
 
@@ -1534,6 +1902,9 @@ class LiteLLMProvider(LLMProvider):
         Empty responses (e.g. Gemini stealth rate-limits that return 200
         with no content) are retried with exponential backoff, mirroring
         the retry behaviour of ``_completion_with_rate_limit_retry``.
+
+        ``system_dynamic_suffix`` is an optional per-turn tail. See
+        ``acomplete`` docstring for the two-block split semantics.
         """
         from framework.llm.stream_events import (
             FinishEvent,
@@ -1553,6 +1924,7 @@ class LiteLLMProvider(LLMProvider):
                 max_tokens=max_tokens,
                 response_format=response_format,
                 json_mode=json_mode,
+                system_dynamic_suffix=system_dynamic_suffix,
             ):
                 yield event
             return
@@ -1563,6 +1935,7 @@ class LiteLLMProvider(LLMProvider):
                 system=system,
                 tools=tools,
                 max_tokens=max_tokens,
+                system_dynamic_suffix=system_dynamic_suffix,
             ):
                 yield event
             return
@@ -1571,12 +1944,42 @@ class LiteLLMProvider(LLMProvider):
         if self._claude_code_oauth:
             billing = _claude_code_billing_header(messages)
             full_messages.append({"role": "system", "content": billing})
-        if system:
-            sys_msg: dict[str, Any] = {"role": "system", "content": system}
-            if _model_supports_cache_control(self.model):
-                sys_msg["cache_control"] = {"type": "ephemeral"}
+        sys_msg = _build_system_message(system, system_dynamic_suffix, self.model)
+        if sys_msg is not None:
             full_messages.append(sys_msg)
         full_messages.extend(messages)
+
+        if logger.isEnabledFor(logging.DEBUG) and full_messages:
+            import json as _json
+            from datetime import datetime as _dt
+            from pathlib import Path as _Path
+
+            _debug_dir = _Path.home() / ".hive" / "debug_logs"
+            _debug_dir.mkdir(parents=True, exist_ok=True)
+            _ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
+            _dump_file = _debug_dir / f"llm_request_{_ts}.json"
+            _summary = []
+            for _mi, _m in enumerate(full_messages):
+                _role = _m.get("role", "?")
+                _c = _m.get("content")
+                _tc = _m.get("tool_calls")
+                _tcid = _m.get("tool_call_id")
+                _summary.append(
+                    {
+                        "idx": _mi,
+                        "role": _role,
+                        "content_length": len(str(_c)) if _c else 0,
+                        "content_preview": str(_c)[:200] if _c else repr(_c),
+                        "has_tool_calls": bool(_tc),
+                        "tool_call_count": len(_tc) if _tc else 0,
+                        "tool_call_id": _tcid,
+                    }
+                )
+            try:
+                _dump_file.write_text(_json.dumps(_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+                logger.debug("[LLM-MSG] %d messages dumped to %s", len(full_messages), _dump_file)
+            except Exception:
+                pass
 
         # Codex Responses API requires an `instructions` field (system prompt).
         # Inject a minimal one when callers don't provide a system message.
@@ -1598,9 +2001,7 @@ class LiteLLMProvider(LLMProvider):
         full_messages = [
             m
             for m in full_messages
-            if not (
-                m.get("role") == "assistant" and not m.get("content") and not m.get("tool_calls")
-            )
+            if not (m.get("role") == "assistant" and not m.get("content") and not m.get("tool_calls"))
         ]
 
         kwargs: dict[str, Any] = {
@@ -1620,12 +2021,47 @@ class LiteLLMProvider(LLMProvider):
             kwargs["api_base"] = self.api_base
         if tools:
             kwargs["tools"] = [self._tool_to_openai_format(t) for t in tools]
+            if _is_ollama_model(self.model):
+                # Ollama requires explicit tool_choice=auto for function calling
+                # so future readers don't have to guess.
+                kwargs.setdefault("tool_choice", "auto")
         if response_format:
             kwargs["response_format"] = response_format
         # The Codex ChatGPT backend (Responses API) rejects several params.
         if self._codex_backend:
             kwargs.pop("max_tokens", None)
             kwargs.pop("stream_options", None)
+            # Pass store directly to OpenAI in case litellm drops it as unknown
+            if "extra_body" not in kwargs:
+                kwargs["extra_body"] = {}
+            kwargs["extra_body"]["store"] = False
+
+        request_summary = _summarize_request_for_log(kwargs)
+        logger.debug(
+            "[stream] prepared request: %s",
+            json.dumps(request_summary, default=str),
+        )
+        if request_summary["system_only"]:
+            logger.warning(
+                "[stream] %s request has no non-system chat messages "
+                "(api_base=%s tools=%d system_chars=%d). "
+                "Some chat-completions backends reject system-only payloads.",
+                self.model,
+                self.api_base,
+                request_summary["tool_count"],
+                sum(
+                    message.get("text_chars", 0)
+                    for message in request_summary["messages"]
+                    if message.get("role") == "system"
+                ),
+            )
+            if self._is_zai_openai_backend():
+                logger.warning(
+                    "[stream] %s appears to be using Z-AI/GLM's OpenAI-compatible backend. "
+                    "This backend has rejected system-only payloads with "
+                    "'The messages parameter is illegal.' in prior requests.",
+                    self.model,
+                )
 
         for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
             # Post-stream events (ToolCall, TextEnd, Finish) are buffered
@@ -1717,6 +2153,10 @@ class LiteLLMProvider(LLMProvider):
 
                     # --- Finish ---
                     if choice.finish_reason:
+                        # Kimi's 'pause_turn' means the model emitted tool
+                        # calls and expects results — equivalent to 'tool_calls'.
+                        if choice.finish_reason == "pause_turn":
+                            choice.finish_reason = "tool_calls" if tool_calls_acc else "stop"
                         stream_finish_reason = choice.finish_reason
                         for _idx, tc_data in sorted(tool_calls_acc.items()):
                             parsed_args = self._parse_tool_call_arguments(
@@ -1751,8 +2191,7 @@ class LiteLLMProvider(LLMProvider):
                                 else getattr(usage, "cache_read_input_tokens", 0) or 0
                             )
                             logger.debug(
-                                "[tokens] finish-chunk usage: "
-                                "input=%d output=%d cached=%d model=%s",
+                                "[tokens] finish-chunk usage: input=%d output=%d cached=%d model=%s",
                                 input_tokens,
                                 output_tokens,
                                 cached_tokens,
@@ -1799,8 +2238,7 @@ class LiteLLMProvider(LLMProvider):
                                 else getattr(_usage, "cache_read_input_tokens", 0) or 0
                             )
                             logger.debug(
-                                "[tokens] post-loop chunks fallback:"
-                                " input=%d output=%d cached=%d model=%s",
+                                "[tokens] post-loop chunks fallback: input=%d output=%d cached=%d model=%s",
                                 input_tokens,
                                 output_tokens,
                                 cached_tokens,
@@ -1884,6 +2322,39 @@ class LiteLLMProvider(LLMProvider):
                         f"(last_role={last_role}). Returning empty result."
                     )
 
+                # Gemini sometimes outputs tool calls as text in
+                # <tool_code>{"name": {...args}}</tool_code> blocks
+                # instead of using the function-calling API.  Extract
+                # these as real ToolCallEvents and strip them from the
+                # text so the rest of the system treats them normally.
+                if accumulated_text and "<tool_code>" in accumulated_text:
+                    extracted, cleaned = _extract_text_tool_calls(accumulated_text)
+                    if extracted:
+                        tool_names = [tc.tool_name for tc in extracted]
+                        logger.info(
+                            "[stream] Model emitted %d tool call(s) as <tool_code> text "
+                            "instead of structured function calls; converting to "
+                            "synthetic ToolCallEvents: %s",
+                            len(extracted),
+                            tool_names,
+                        )
+                        accumulated_text = cleaned
+                        # Emit a corrected TextDeltaEvent so the caller's
+                        # accumulated_text is overwritten with the cleaned text.
+                        yield TextDeltaEvent(content="", snapshot=cleaned)
+                        # Insert synthetic ToolCallEvents before FinishEvent.
+                        finish_idx = next(
+                            (i for i, ev in enumerate(tail_events) if isinstance(ev, FinishEvent)),
+                            len(tail_events),
+                        )
+                        for tc_ev in reversed(extracted):
+                            tail_events.insert(finish_idx, tc_ev)
+                        # Update TextEndEvent if present.
+                        for _i, _ev in enumerate(tail_events):
+                            if isinstance(_ev, TextEndEvent):
+                                tail_events[_i] = TextEndEvent(full_text=cleaned)
+                                break
+
                 # Success (or empty after exhausted retries) — flush events.
                 for event in tail_events:
                     yield event
@@ -1903,6 +2374,36 @@ class LiteLLMProvider(LLMProvider):
                 return
 
             except Exception as e:
+                # Some providers return non-standard finish_reason values
+                # (e.g., kimi-k2.5 sends 'pause_turn') that LiteLLM's
+                # internal stream_chunk_builder rejects via Pydantic
+                # validation.  If we already accumulated content and built
+                # tail_events before the error, the stream was successful —
+                # yield what we have instead of discarding it.
+                if (accumulated_text or tool_calls_acc) and tail_events:
+                    # LiteLLM may wrap the original ValidationError in an
+                    # APIError with a different message.  Check the full
+                    # exception chain (str(e) + str(__cause__)).
+                    _err_chain = f"{e} {e.__cause__}" if e.__cause__ else str(e)
+                    _is_finish_reason_err = (
+                        "finish_reason" in _err_chain and "validation error" in _err_chain.lower()
+                    ) or (
+                        # Fallback: the APIError wrapper message for chunk-building failures
+                        "building chunks" in str(e).lower() and (accumulated_text or tool_calls_acc)
+                    )
+                    if _is_finish_reason_err:
+                        logger.warning(
+                            "[stream] %s: LiteLLM finish_reason validation "
+                            "error (non-standard provider value). "
+                            "Content was streamed successfully — "
+                            "using accumulated result. Error: %s",
+                            self.model,
+                            e,
+                        )
+                        for event in tail_events:
+                            yield event
+                        return
+
                 if self._should_use_openrouter_tool_compat(e, tools):
                     _remember_openrouter_tool_compat_model(self.model)
                     async for event in self._stream_via_openrouter_tool_compat(
@@ -1913,16 +2414,30 @@ class LiteLLMProvider(LLMProvider):
                     ):
                         yield event
                     return
-                if _is_stream_transient_error(e) and attempt < RATE_LIMIT_MAX_RETRIES:
+                if _is_stream_transient_error(e) and attempt < STREAM_TRANSIENT_MAX_RETRIES:
                     wait = _compute_retry_delay(attempt, exception=e)
                     logger.warning(
                         f"[stream-retry] {self.model} transient error "
                         f"({type(e).__name__}): {e!s}. "
                         f"Retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{STREAM_TRANSIENT_MAX_RETRIES})"
                     )
                     await asyncio.sleep(wait)
                     continue
+                dump_path = _dump_failed_request(
+                    model=self.model,
+                    kwargs=kwargs,
+                    error_type=f"stream_exception_{type(e).__name__.lower()}",
+                    attempt=attempt,
+                )
+                logger.error(
+                    "[stream] %s request failed with %s: %s | request=%s | dump=%s",
+                    self.model,
+                    type(e).__name__,
+                    e,
+                    json.dumps(_summarize_request_for_log(kwargs), default=str),
+                    dump_path,
+                )
                 recoverable = _is_stream_transient_error(e)
                 yield StreamErrorEvent(error=str(e), recoverable=recoverable)
                 return
